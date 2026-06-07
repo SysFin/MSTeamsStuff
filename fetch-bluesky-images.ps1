@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    Downloads images from a Bluesky account into the backgrounds/ folder.
+    Downloads images from a Bluesky account, with optional interactive review before
+    they land in the backgrounds/ folder.
 
 .PARAMETER Handle
     Bluesky handle to fetch from, e.g. "user.bsky.social" or "user.custom.domain"
@@ -15,20 +16,25 @@
 .PARAMETER MaxImages
     Maximum number of images to download (newest first). Default: 50
 
+.PARAMETER Review
+    When set, images are downloaded to a staging/ folder and opened one-by-one for review.
+    Press Y to keep (moves to backgrounds/), N to discard, or Q to stop reviewing early.
+    Already-reviewed images are remembered so re-running only shows new ones.
+
 .PARAMETER OutputDir
-    Folder to save images into. Defaults to backgrounds/ next to this script.
+    Final destination for approved images. Defaults to backgrounds/ next to this script.
 
 .EXAMPLE
-    # Public profile — no login needed
+    # Download directly — no review
     .\fetch-bluesky-images.ps1 -Handle "natgeo.bsky.social"
 
 .EXAMPLE
-    # Private profile — login required
-    .\fetch-bluesky-images.ps1 -Handle "friend.bsky.social" -Username "you.bsky.social" -Password "xxxx-xxxx-xxxx-xxxx"
+    # Download to staging and review each image before approving
+    .\fetch-bluesky-images.ps1 -Handle "natgeo.bsky.social" -Review
 
 .EXAMPLE
-    # Limit to 20 images
-    .\fetch-bluesky-images.ps1 -Handle "someone.bsky.social" -MaxImages 20
+    # Private profile with review
+    .\fetch-bluesky-images.ps1 -Handle "friend.bsky.social" -Username "you.bsky.social" -Password "xxxx-xxxx-xxxx-xxxx" -Review
 #>
 
 [CmdletBinding()]
@@ -38,6 +44,8 @@ param(
 
     [string]$Username,
     [string]$Password,
+
+    [switch]$Review,
 
     [int]$MaxImages = 50,
 
@@ -72,14 +80,22 @@ $resolved = Invoke-RestMethod -Uri "$PDS/xrpc/com.atproto.identity.resolveHandle
 $did = $resolved.did
 Write-Host "DID: $did"
 
-# ── Fetch posts and collect image URLs ───────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
 
-if (-not (Test-Path $OutputDir)) {
-    New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
+$stagingDir = Join-Path $PSScriptRoot 'staging'
+
+$downloadDir = if ($Review) { $stagingDir } else { $OutputDir }
+
+foreach ($dir in @($OutputDir, $downloadDir)) {
+    if (-not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    }
 }
 
+# ── Fetch posts and collect image URLs ───────────────────────────────────────
+
 # Load manifest of already-downloaded files to skip duplicates
-$manifestFile = Join-Path $OutputDir '.bluesky-manifest.json'
+$manifestFile = Join-Path $downloadDir '.bluesky-manifest.json'
 $manifest = if (Test-Path $manifestFile) {
     (Get-Content $manifestFile -Raw | ConvertFrom-Json).downloaded
 } else {
@@ -152,6 +168,7 @@ foreach ($img in $imageUrls) {
     }
 
     try {
+        $destPath = Join-Path $downloadDir $fileName
         Invoke-WebRequest -Uri $img.Url -Headers $headers -OutFile $destPath -UseBasicParsing
         $manifestSet.Add($img.Cid) | Out-Null
         $downloaded++
@@ -166,4 +183,91 @@ foreach ($img in $imageUrls) {
 
 Write-Host ""
 Write-Host "Done. Downloaded: $downloaded  Skipped (already have): $skipped"
-Write-Host "Images saved to: $OutputDir"
+
+if (-not $Review) {
+    Write-Host "Images saved to: $OutputDir"
+    exit 0
+}
+
+# ── Interactive review ────────────────────────────────────────────────────────
+
+$pendingImages = Get-ChildItem $stagingDir -Include '*.jpg','*.jpeg','*.png' -File -ErrorAction SilentlyContinue |
+    Sort-Object Name
+
+# Load review manifest so already-reviewed images aren't shown again
+$reviewManifestFile = Join-Path $stagingDir '.review-manifest.json'
+$reviewed = if (Test-Path $reviewManifestFile) {
+    [System.Collections.Generic.HashSet[string]]::new(
+        (Get-Content $reviewManifestFile -Raw | ConvertFrom-Json).reviewed
+    )
+} else {
+    [System.Collections.Generic.HashSet[string]]::new()
+}
+
+$toReview = $pendingImages | Where-Object { -not $reviewed.Contains($_.Name) }
+
+if (-not $toReview) {
+    Write-Host "No new images to review in staging/."
+    exit 0
+}
+
+Write-Host ""
+Write-Host "── Review mode ──────────────────────────────────────────────────"
+Write-Host "  Y  →  approve (moves to backgrounds/)"
+Write-Host "  N  →  discard (removes from staging/)"
+Write-Host "  S  →  skip for now (leaves in staging/ to review later)"
+Write-Host "  Q  →  quit review, leave remaining for later"
+Write-Host "─────────────────────────────────────────────────────────────────"
+Write-Host ""
+
+$approved  = 0
+$discarded = 0
+
+foreach ($file in $toReview) {
+    # Open the image in the default viewer
+    $proc = Start-Process $file.FullName -PassThru
+
+    Write-Host "[$($toReview.IndexOf($file) + 1)/$($toReview.Count)] $($file.Name)"
+    if ($file.Name -match 'bsky_(.+)_[a-zA-Z0-9]+\.jpg') { Write-Host "  From: $($Matches[1])" }
+    $choice = $null
+    while ($choice -notin @('Y','N','S','Q')) {
+        $choice = (Read-Host "  Keep? [Y/N/S/Q]").Trim().ToUpper()
+    }
+
+    # Close the image viewer
+    try { if (-not $proc.HasExited) { $proc.CloseMainWindow() | Out-Null } } catch {}
+
+    switch ($choice) {
+        'Y' {
+            $dest = Join-Path $OutputDir $file.Name
+            Move-Item $file.FullName $dest -Force
+            $reviewed.Add($file.Name) | Out-Null
+            $approved++
+            Write-Host "  → Approved."
+        }
+        'N' {
+            Remove-Item $file.FullName -Force
+            $reviewed.Add($file.Name) | Out-Null
+            $discarded++
+            Write-Host "  → Discarded."
+        }
+        'S' {
+            Write-Host "  → Skipped (still in staging/)."
+        }
+        'Q' {
+            Write-Host "  → Stopping review. Remaining images stay in staging/."
+            break
+        }
+    }
+
+    if ($choice -eq 'Q') { break }
+}
+
+# Save review manifest
+[PSCustomObject]@{ reviewed = @($reviewed) } | ConvertTo-Json | Set-Content $reviewManifestFile -Encoding UTF8
+
+Write-Host ""
+Write-Host "Review complete. Approved: $approved  Discarded: $discarded"
+Write-Host "Approved images saved to: $OutputDir"
+$remaining = (Get-ChildItem $stagingDir -Include '*.jpg','*.jpeg','*.png' -File -ErrorAction SilentlyContinue).Count
+if ($remaining -gt 0) { Write-Host "Remaining in staging/ for later: $remaining" }
