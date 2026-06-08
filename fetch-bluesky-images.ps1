@@ -212,16 +212,23 @@ if (-not $toReview) {
 }
 
 Write-Host ""
+$processingDir = Join-Path $PSScriptRoot 'processing'
+if (-not (Test-Path $processingDir)) {
+    New-Item -ItemType Directory -Force -Path $processingDir | Out-Null
+}
+
 Write-Host "── Review mode ──────────────────────────────────────────────────"
 Write-Host "  Y  →  approve (moves to backgrounds/)"
 Write-Host "  N  →  discard (removes from staging/)"
+Write-Host "  P  →  needs processing (moves to processing/)"
 Write-Host "  S  →  skip for now (leaves in staging/ to review later)"
 Write-Host "  Q  →  quit review, leave remaining for later"
 Write-Host "─────────────────────────────────────────────────────────────────"
 Write-Host ""
 
-$approved  = 0
-$discarded = 0
+$approved    = 0
+$discarded   = 0
+$sentForProc = 0
 
 foreach ($file in $toReview) {
     # Open the image in the default viewer
@@ -230,8 +237,8 @@ foreach ($file in $toReview) {
     Write-Host "[$($toReview.IndexOf($file) + 1)/$($toReview.Count)] $($file.Name)"
     if ($file.Name -match 'bsky_(.+)_[a-zA-Z0-9]+\.jpg') { Write-Host "  From: $($Matches[1])" }
     $choice = $null
-    while ($choice -notin @('Y','N','S','Q')) {
-        $choice = (Read-Host "  Keep? [Y/N/S/Q]").Trim().ToUpper()
+    while ($choice -notin @('Y','N','P','S','Q')) {
+        $choice = (Read-Host "  Keep? [Y/N/P/S/Q]").Trim().ToUpper()
     }
 
     # Close the image viewer
@@ -251,6 +258,13 @@ foreach ($file in $toReview) {
             $discarded++
             Write-Host "  → Discarded."
         }
+        'P' {
+            $dest = Join-Path $processingDir $file.Name
+            Move-Item $file.FullName $dest -Force
+            $reviewed.Add($file.Name) | Out-Null
+            $sentForProc++
+            Write-Host "  → Moved to processing/. Edit it there and drop it into backgrounds/ when ready."
+        }
         'S' {
             Write-Host "  → Skipped (still in staging/)."
         }
@@ -267,7 +281,9 @@ foreach ($file in $toReview) {
 [PSCustomObject]@{ reviewed = @($reviewed) } | ConvertTo-Json | Set-Content $reviewManifestFile -Encoding UTF8
 
 Write-Host ""
-Write-Host "Review complete. Approved: $approved  Discarded: $discarded"
+Write-Host "Review complete. Approved: $approved  Discarded: $discarded  Sent for processing: $sentForProc"
 Write-Host "Approved images saved to: $OutputDir"
 $remaining = (Get-ChildItem $stagingDir -Include '*.jpg','*.jpeg','*.png' -File -ErrorAction SilentlyContinue).Count
 if ($remaining -gt 0) { Write-Host "Remaining in staging/ for later: $remaining" }
+$inProc = (Get-ChildItem $processingDir -Include '*.jpg','*.jpeg','*.png' -File -ErrorAction SilentlyContinue).Count
+if ($inProc -gt 0) { Write-Host "Awaiting processing in processing/: $inProc  (move to backgrounds/ when done)" }
